@@ -1,0 +1,251 @@
+package main
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"fmt"
+	"io"
+	"log"
+	"net"
+	"os"
+	"os/signal"
+	"sync"
+	"sync/atomic"
+	"syscall"
+	"time"
+
+	"github.com/blockrouter/db"
+	mcpb "github.com/blockrouter/pb"
+)
+
+func handleConnection(ctx context.Context, conn net.Conn) {
+	defer conn.Close()
+
+	// Set read deadline based on context
+	deadline, ok := ctx.Deadline()
+	if ok {
+		conn.SetReadDeadline(deadline)
+	}
+
+	inspectBuffer := new(bytes.Buffer)
+	inspectReader := io.TeeReader(conn, inspectBuffer)
+	bufferedReader := bufio.NewReader(inspectReader)
+
+	receivedPacket, err := mcpb.ReadPacket(bufferedReader, conn.RemoteAddr(), mcpb.StateHandshaking)
+	if err != nil {
+		log.Printf("Error reading packet from %v: %v", conn.RemoteAddr(), err)
+		return
+	}
+
+	if receivedPacket.PacketID == mcpb.PacketIdHandshake {
+		hs, err := mcpb.DecodeHandshake(receivedPacket.Data)
+		if err != nil {
+			log.Printf("Error decoding handshake from %v: %v", conn.RemoteAddr(), err)
+			return
+		}
+		fmt.Printf("hs.ServerAddress: %v\n", hs.ServerAddress)
+
+		if hs.NextState == mcpb.StateLogin {
+			connectConnections(ctx, conn, hs, inspectBuffer)
+		}
+	}
+
+	if receivedPacket.PacketID == 0xFE { // LegacyServerListPing
+		fmt.Println("Received legacy server list ping")
+		hs, ok := receivedPacket.Data.(*mcpb.LegacyServerListPing)
+		if !ok {
+			log.Printf("Error decoding legacy server list ping from %v: expected *mcproto.LegacyServerListPing, got %T", conn.RemoteAddr(), receivedPacket.Data)
+		}
+
+		connectConnections(ctx, conn, &mcpb.Handshake{
+			ProtocolVersion: hs.ProtocolVersion,
+			ServerAddress:   hs.ServerAddress,
+			ServerPort:      hs.ServerPort,
+			NextState:       mcpb.StateStatus,
+		}, inspectBuffer)
+	}
+}
+
+func connectConnections(ctx context.Context, conn net.Conn, hs *mcpb.Handshake, inspectBuffer *bytes.Buffer) {
+	fmt.Printf("Handshake received from %v: %+v\n", conn.RemoteAddr(), hs)
+
+	// Create a context for the backend connection with timeout
+	dialCtx, dialCancel := context.WithTimeout(ctx, 10*time.Second)
+	defer dialCancel()
+
+	var dialer net.Dialer
+	targetAddr := database.FindServerAddrByHost(hs.ServerAddress)
+	if targetAddr == "" {
+		log.Printf("No backend server found for subdomain %s", hs.ServerAddress)
+		return
+	}
+	beConn, err := dialer.DialContext(dialCtx, "tcp", targetAddr)
+	if err != nil {
+		log.Printf("Error connecting to backend server: %v", err)
+		return
+	}
+	defer beConn.Close()
+
+	// Write the captured handshake data to backend
+	if _, err := beConn.Write(inspectBuffer.Bytes()); err != nil {
+		log.Printf("Error writing to backend server: %v", err)
+		return
+	}
+
+	fmt.Printf("Connected to backend server: %v\n", beConn.RemoteAddr())
+
+	// Create a context for the proxy session that can be cancelled
+	proxyCtx, proxyCancel := context.WithCancel(ctx)
+	defer proxyCancel()
+
+	var wg sync.WaitGroup
+
+	// Client to backend
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		defer proxyCancel() // Cancel the other goroutine when this one ends
+		copyWithContext(proxyCtx, beConn, conn, "client->backend")
+	}()
+
+	// Backend to client
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		defer proxyCancel() // Cancel the other goroutine when this one ends
+		copyWithContext(proxyCtx, conn, beConn, "backend->client")
+	}()
+
+	// Wait for either goroutine to finish or context to be cancelled
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		fmt.Printf("Proxy session ended for %v\n", conn.RemoteAddr())
+	case <-proxyCtx.Done():
+		fmt.Printf("Proxy session cancelled for %v: %v\n", conn.RemoteAddr(), proxyCtx.Err())
+	}
+}
+
+// copyWithContext copies data from src to dst while respecting context cancellation
+func copyWithContext(ctx context.Context, dst io.Writer, src io.Reader, direction string) {
+	// Create a buffer for copying
+	buf := make([]byte, 32*1024)
+
+	for {
+		select {
+		case <-ctx.Done():
+			log.Printf("Copy cancelled (%s): %v", direction, ctx.Err())
+			return
+		default:
+		}
+
+		// Set read timeout if possible
+		if conn, ok := src.(net.Conn); ok {
+			conn.SetReadDeadline(time.Now().Add(30 * time.Second))
+		}
+
+		n, err := src.Read(buf)
+		if n > 0 {
+			// Set write timeout if possible
+			if conn, ok := dst.(net.Conn); ok {
+				conn.SetWriteDeadline(time.Now().Add(30 * time.Second))
+			}
+
+			if _, writeErr := dst.Write(buf[:n]); writeErr != nil {
+				log.Printf("Write error (%s): %v", direction, writeErr)
+				return
+			}
+		}
+
+		if err != nil {
+			if err != io.EOF {
+				log.Printf("Read error (%s): %v", direction, err)
+			}
+			return
+		}
+	}
+}
+
+var database *db.Db
+
+func main() {
+	var err error
+	database, err = db.NewDb("mongodb://root:safe()Password@localhost:27017", "serverpanel")
+	if err != nil {
+		log.Fatalf("Failed to connect to database: %v", err)
+	}
+	// Create a context that can be cancelled for graceful shutdown
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Handle graceful shutdown on SIGINT/SIGTERM
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+
+	go func() {
+		<-sigChan
+		log.Println("Received shutdown signal, stopping server...")
+		cancel()
+	}()
+
+	l, err := net.Listen("tcp", ":25565")
+	if err != nil {
+		log.Fatalf("Failed to listen on port 25565: %v", err)
+	}
+	defer l.Close()
+
+	log.Println("BlockRouter started on :25565")
+
+	// Track active connections
+	var wg sync.WaitGroup
+	var activeConnections atomic.Int32
+
+	go func() {
+		for {
+			time.Sleep(5 * time.Second)
+			fmt.Println("Active connections:", activeConnections.Load())
+		}
+	}()
+
+	for {
+		select {
+		case <-ctx.Done():
+			log.Println("Server shutting down...")
+			// Wait for all connections to finish
+			wg.Wait()
+			return
+		default:
+		}
+
+		// Set accept timeout to allow checking for context cancellation
+		if tcpListener, ok := l.(*net.TCPListener); ok {
+			tcpListener.SetDeadline(time.Now().Add(1 * time.Second))
+		}
+
+		conn, err := l.Accept()
+		if err != nil {
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				// Timeout is expected, continue to check context
+				continue
+			}
+			log.Printf("Error accepting connection: %v", err)
+			continue
+		}
+
+		log.Printf("New connection established: %v", conn.RemoteAddr())
+
+		wg.Add(1)
+		activeConnections.Add(1)
+		go func(conn net.Conn) {
+			defer wg.Done()
+			defer activeConnections.Add(-1)
+			handleConnection(ctx, conn)
+		}(conn)
+	}
+}
