@@ -47,9 +47,28 @@ func handleConnection(ctx context.Context, conn net.Conn) {
 		}
 
 		server := database.FindServerAddrByHost(hs.ServerAddress)
+		if server == nil {
+			log.Printf("No server found for host: %s", hs.ServerAddress)
+			return
+		}
 
-		if hs.NextState == mcpb.StateLogin {
-			connectToBackend(ctx, conn, server, inspectBuffer)
+		switch hs.NextState {
+		case mcpb.StateLogin:
+			// This is a login attempt - always forward to backend if running
+			if server.Status == "Running" {
+				connectToBackend(ctx, conn, server, inspectBuffer)
+			} else {
+				log.Printf("Login attempt to non-running server %s (status: %s)", server.Name, server.Status)
+				return
+			}
+		case mcpb.StateStatus:
+			// This is a status/ping request - handle based on server status
+			if server.Status == "Running" {
+				connectToBackend(ctx, conn, server, inspectBuffer)
+			} else {
+				// For stopped servers, we need to handle the status protocol manually
+				// handleOfflineStatusRequest(ctx, conn, server, hs)
+			}
 		}
 
 	case mcpb.PacketIdLegacyServerListPing:
@@ -65,6 +84,7 @@ func handleConnection(ctx context.Context, conn net.Conn) {
 
 		switch server.Status {
 		case "Running":
+			// Forward the legacy ping to the backend server so it can respond with real-time data
 			connectToBackend(ctx, conn, server, inspectBuffer)
 
 		case "Stopped":
@@ -270,5 +290,102 @@ func main() {
 			defer activeConnections.Add(-1)
 			handleConnection(ctx, conn)
 		}(conn)
+	}
+}
+
+func handleOfflineStatusRequest(ctx context.Context, conn net.Conn, server *db.Server, hs *mcpb.Handshake) {
+	// We need to continue reading packets in the status state
+	bufferedReader := bufio.NewReader(conn)
+
+	for {
+		// Read the next packet in status state
+		packet, err := mcpb.ReadPacket(bufferedReader, conn.RemoteAddr(), mcpb.StateStatus)
+		if err != nil {
+			log.Printf("Error reading status packet: %v", err)
+			return
+		}
+
+		switch packet.PacketID {
+		case 0x00: // Status Request
+			// Send status response
+			statusJSON := fmt.Sprintf(`{
+				"version": {
+					"name": "%s",
+					"protocol": %d
+				},
+				"players": {
+					"max": 0,
+					"online": 0,
+					"sample": [
+						{"name": "§cServer Offline", "id": "00000000-0000-0000-0000-000000000000"},
+						{"name": "§7Check back later!", "id": "00000000-0000-0000-0000-000000000001"},
+						{"name": "§eStatus: Stopped", "id": "00000000-0000-0000-0000-000000000002"}
+					]
+				},
+				"description": {
+					"text": "§c%s§r - Server is currently offline"
+				}
+			}`, server.GameConfig.Version, hs.ProtocolVersion, server.Name)
+
+			// Write status response packet
+			var buf bytes.Buffer
+			if err := mcpb.WriteVarInt(&buf, 0x00); err != nil { // Packet ID
+				log.Printf("Error writing packet ID: %v", err)
+				return
+			}
+			if err := mcpb.WriteString(&buf, statusJSON); err != nil { // JSON payload
+				log.Printf("Error writing JSON: %v", err)
+				return
+			}
+
+			// Send the packet with length prefix
+			var finalBuf bytes.Buffer
+			if err := mcpb.WriteVarInt(&finalBuf, buf.Len()); err != nil { // Packet length
+				log.Printf("Error writing packet length: %v", err)
+				return
+			}
+			finalBuf.Write(buf.Bytes())
+
+			if _, err := conn.Write(finalBuf.Bytes()); err != nil {
+				log.Printf("Error sending status response: %v", err)
+				return
+			}
+
+		case 0x01: // Ping Request
+			// Read the ping payload (8 bytes)
+			data := packet.Data.([]byte)
+			if len(data) < 8 {
+				log.Printf("Invalid ping packet length: %d", len(data))
+				return
+			}
+
+			// Send pong response with same payload
+			var buf bytes.Buffer
+			if err := mcpb.WriteVarInt(&buf, 0x01); err != nil { // Packet ID
+				log.Printf("Error writing pong packet ID: %v", err)
+				return
+			}
+			buf.Write(data[:8]) // Echo the ping payload
+
+			// Send the packet with length prefix
+			var finalBuf bytes.Buffer
+			if err := mcpb.WriteVarInt(&finalBuf, buf.Len()); err != nil { // Packet length
+				log.Printf("Error writing pong packet length: %v", err)
+				return
+			}
+			finalBuf.Write(buf.Bytes())
+
+			if _, err := conn.Write(finalBuf.Bytes()); err != nil {
+				log.Printf("Error sending pong response: %v", err)
+				return
+			}
+
+			// After pong, the client typically closes the connection
+			return
+
+		default:
+			log.Printf("Unknown status packet ID: 0x%02X", packet.PacketID)
+			return
+		}
 	}
 }
