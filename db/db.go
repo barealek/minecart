@@ -35,20 +35,26 @@ func (db *Db) Close() error {
 	return nil
 }
 
-type server struct {
-	Endpoint  string `bson:"endpoint"`
-	Subdomain string `bson:"subdomain"`
+type Server struct {
+	Name       string `bson:"name"`
+	Subdomain  string `bson:"subdomain"`
+	Endpoint   string `bson:"endpoint"`
+	Status     string `bson:"status"`
+	GameConfig struct {
+		MessageofTheDay string
+		Version         string
+	} `bson:"game_config"`
 }
 
-func (d *Db) FindServerAddrByHost(host string) string {
-	var srvr server
+func (d *Db) FindServerAddrByHost(host string) *Server {
+	var srvr Server
 
 	db := d.cl.Database(d.dbName)
 
 	err := db.Collection("servers").FindOne(context.Background(), map[string]string{"subdomain": host}).Decode(&srvr)
 	if err != nil {
 		fmt.Println("Error finding server by host:", err)
-		return ""
+		return nil
 	}
-	return srvr.Endpoint
+	return &srvr
 }
