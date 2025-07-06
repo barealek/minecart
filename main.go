@@ -55,15 +55,23 @@ func handleConnection(ctx context.Context, conn net.Conn) {
 		fmt.Println("Received legacy server list ping")
 		hs, ok := receivedPacket.Data.(*mcpb.LegacyServerListPing)
 		if !ok {
-			log.Printf("Error decoding legacy server list ping from %v: expected *mcproto.LegacyServerListPing, got %T", conn.RemoteAddr(), receivedPacket.Data)
+			log.Printf("Error decoding legacy server list ping from %v: expected *mcpb.LegacyServerListPing, got %T", conn.RemoteAddr(), receivedPacket.Data)
+			return
 		}
 
-		connectConnections(ctx, conn, &mcpb.Handshake{
-			ProtocolVersion: hs.ProtocolVersion,
-			ServerAddress:   hs.ServerAddress,
-			ServerPort:      hs.ServerPort,
-			NextState:       mcpb.StateStatus,
-		}, inspectBuffer)
+		// Respond with a sample MOTD and player information
+		err := mcpb.WriteLegacyServerListPingResponse(
+			conn,
+			hs.ProtocolVersion,
+			"1.20.1", // Server version
+			"§aBlockRouter§r - Sample MOTD\n§bWelcome to the server!", // MOTD with color codes
+			5,   // Current players
+			100, // Max players
+		)
+		if err != nil {
+			log.Printf("Error writing legacy server list ping response to %v: %v", conn.RemoteAddr(), err)
+		}
+		return
 	}
 }
 
