@@ -63,11 +63,16 @@ func handleConnection(ctx context.Context, conn net.Conn) {
 			}
 		case mcpb.StateStatus:
 			// This is a status/ping request - handle based on server status
-			if server.Status == "Running" {
+			switch server.Status {
+			case "Running":
 				connectToBackend(ctx, conn, server, inspectBuffer)
-			} else {
+			case "Stopped":
 				// For stopped servers, we need to handle the status protocol manually
-				// handleOfflineStatusRequest(ctx, conn, server, hs)
+				var motd = fmt.Sprintf("» §c%s§r\n§r» Server is currently offline", server.Name)
+				handleOfflineStatusRequest(conn, server, "§9🌙 Sleeping...", motd)
+			case "Starting":
+				var motd = fmt.Sprintf("» §c%s§r\n§r» Server is starting...", server.Name)
+				handleOfflineStatusRequest(conn, server, "§9🌙 Starting...", motd)
 			}
 		}
 
@@ -100,12 +105,13 @@ func handleConnection(ctx context.Context, conn net.Conn) {
 				log.Printf("Error writing legacy server list ping response to %v: %v", conn.RemoteAddr(), err)
 			}
 
-		default:
+		case "Starting":
+			log.Printf("Received legacy server list ping for server %s with unknown status: %s", server.Name, server.Status)
 			err := mcpb.WriteLegacyServerListPingResponse(
 				conn,
 				hs.ProtocolVersion,
 				server.GameConfig.Version,
-				fmt.Sprintf("§c%s§r - Server is currently awkward", server.Name),
+				fmt.Sprintf("§c%s§r - Server is currently starting!", server.Name),
 				0, // Current players
 				0, // Max players
 			)
@@ -293,7 +299,8 @@ func main() {
 	}
 }
 
-func handleOfflineStatusRequest(ctx context.Context, conn net.Conn, server *db.Server, hs *mcpb.Handshake) {
+func handleOfflineStatusRequest(conn net.Conn, server *db.Server, statusText, motd string) {
+	fmt.Println("Handling offline status request for server:", server.Name)
 	// We need to continue reading packets in the status state
 	bufferedReader := bufio.NewReader(conn)
 
@@ -311,21 +318,16 @@ func handleOfflineStatusRequest(ctx context.Context, conn net.Conn, server *db.S
 			statusJSON := fmt.Sprintf(`{
 				"version": {
 					"name": "%s",
-					"protocol": %d
+					"protocol": 9999
 				},
 				"players": {
 					"max": 0,
-					"online": 0,
-					"sample": [
-						{"name": "§cServer Offline", "id": "00000000-0000-0000-0000-000000000000"},
-						{"name": "§7Check back later!", "id": "00000000-0000-0000-0000-000000000001"},
-						{"name": "§eStatus: Stopped", "id": "00000000-0000-0000-0000-000000000002"}
-					]
+					"online": 0
 				},
 				"description": {
-					"text": "§c%s§r - Server is currently offline"
+					"text": "%s"
 				}
-			}`, server.GameConfig.Version, hs.ProtocolVersion, server.Name)
+			}`, statusText, motd)
 
 			// Write status response packet
 			var buf bytes.Buffer
