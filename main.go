@@ -38,7 +38,8 @@ func handleConnection(ctx context.Context, conn net.Conn) {
 		return
 	}
 
-	if receivedPacket.PacketID == mcpb.PacketIdHandshake {
+	switch receivedPacket.PacketID {
+	case mcpb.PacketIdHandshake:
 		hs, err := mcpb.DecodeHandshake(receivedPacket.Data)
 		if err != nil {
 			log.Printf("Error decoding handshake from %v: %v", conn.RemoteAddr(), err)
@@ -50,9 +51,8 @@ func handleConnection(ctx context.Context, conn net.Conn) {
 		if hs.NextState == mcpb.StateLogin {
 			connectToBackend(ctx, conn, server, inspectBuffer)
 		}
-	}
 
-	if receivedPacket.PacketID == 0xFE { // LegacyServerListPing
+	case mcpb.PacketIdLegacyServerListPing:
 		fmt.Println("Received legacy server list ping")
 		hs, ok := receivedPacket.Data.(*mcpb.LegacyServerListPing)
 
@@ -76,9 +76,8 @@ func handleConnection(ctx context.Context, conn net.Conn) {
 				log.Printf("Error writing legacy server list ping response to %v: %v", conn.RemoteAddr(), err)
 			}
 		}
-
-		return
 	}
+
 }
 
 func connectToBackend(ctx context.Context, conn net.Conn, server *db.Server, inspectBuffer *bytes.Buffer) {
