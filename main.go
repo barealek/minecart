@@ -44,7 +44,7 @@ func handleConnection(ctx context.Context, conn net.Conn) {
 			log.Printf("Error decoding handshake from %v: %v", conn.RemoteAddr(), err)
 			return
 		}
-		fmt.Printf("hs.ServerAddress: %v\n", hs.ServerAddress)
+
 		server := database.FindServerAddrByHost(hs.ServerAddress)
 
 		if hs.NextState == mcpb.StateLogin {
@@ -63,14 +63,31 @@ func handleConnection(ctx context.Context, conn net.Conn) {
 
 		server := database.FindServerAddrByHost(hs.ServerAddress)
 
-		if server.Status != "Running" {
+		switch server.Status {
+		case "Running":
+			connectToBackend(ctx, conn, server, inspectBuffer)
+
+		case "Stopped":
 			err := mcpb.WriteLegacyServerListPingResponse(
 				conn,
 				hs.ProtocolVersion,
 				server.GameConfig.Version,
-				fmt.Sprintf("§c%s§r - Server is currently offline 😴", server.Name),
-				5,   // Current players
-				100, // Max players
+				fmt.Sprintf("§c%s§r - Server is currently offline", server.Name),
+				0, // Current players
+				0, // Max players
+			)
+			if err != nil {
+				log.Printf("Error writing legacy server list ping response to %v: %v", conn.RemoteAddr(), err)
+			}
+
+		default:
+			err := mcpb.WriteLegacyServerListPingResponse(
+				conn,
+				hs.ProtocolVersion,
+				server.GameConfig.Version,
+				fmt.Sprintf("§c%s§r - Server is currently awkward", server.Name),
+				0, // Current players
+				0, // Max players
 			)
 			if err != nil {
 				log.Printf("Error writing legacy server list ping response to %v: %v", conn.RemoteAddr(), err)
@@ -87,12 +104,7 @@ func connectToBackend(ctx context.Context, conn net.Conn, server *db.Server, ins
 	defer dialCancel()
 
 	var dialer net.Dialer
-	backendServer := database.FindServerAddrByHost(server.Endpoint)
-	if backendServer == nil {
-		log.Printf("No backend server found for subdomain %s", server)
-		return
-	}
-	beConn, err := dialer.DialContext(dialCtx, "tcp", backendServer.Endpoint)
+	beConn, err := dialer.DialContext(dialCtx, "tcp", server.Endpoint)
 	if err != nil {
 		log.Printf("Error connecting to backend server: %v", err)
 		return
