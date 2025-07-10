@@ -85,3 +85,60 @@ func WriteString(writer io.Writer, value string) error {
 	_, err := writer.Write([]byte(value))
 	return err
 }
+
+// WriteLoginDisconnect writes a login disconnect packet with the given reason
+func WriteLoginDisconnect(writer io.Writer, reason string) error {
+	// Create JSON chat component for the disconnect message
+	jsonMessage := fmt.Sprintf(`{"text":"%s","color":"red"}`, reason)
+
+	// Calculate packet length (PacketID + JSON message length)
+	packetData := []byte{}
+
+	// Write packet ID (0x00 for Login Disconnect)
+	packetIdData := []byte{}
+	if err := writeVarIntToBuffer(&packetIdData, 0x00); err != nil {
+		return err
+	}
+	packetData = append(packetData, packetIdData...)
+
+	// Write JSON message
+	jsonData := []byte{}
+	if err := writeStringToBuffer(&jsonData, jsonMessage); err != nil {
+		return err
+	}
+	packetData = append(packetData, jsonData...)
+
+	// Write packet length
+	if err := WriteVarInt(writer, len(packetData)); err != nil {
+		return err
+	}
+
+	// Write packet data
+	_, err := writer.Write(packetData)
+	return err
+}
+
+// Helper function to write VarInt to a buffer
+func writeVarIntToBuffer(buffer *[]byte, value int) error {
+	for {
+		temp := byte(value & 0x7F)
+		value >>= 7
+		if value != 0 {
+			temp |= 0x80
+		}
+		*buffer = append(*buffer, temp)
+		if value == 0 {
+			break
+		}
+	}
+	return nil
+}
+
+// Helper function to write string to a buffer
+func writeStringToBuffer(buffer *[]byte, value string) error {
+	if err := writeVarIntToBuffer(buffer, len(value)); err != nil {
+		return err
+	}
+	*buffer = append(*buffer, []byte(value)...)
+	return nil
+}

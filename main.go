@@ -49,7 +49,17 @@ func handleConnection(ctx context.Context, conn net.Conn) {
 		server := database.FindServerAddrByHost(hs.ServerAddress)
 
 		if hs.NextState == mcpb.StateLogin {
-			connectToBackend(ctx, conn, server, inspectBuffer)
+			// Check server status before connecting
+			switch server.Status {
+			case "Running":
+				connectToBackend(ctx, conn, server, inspectBuffer)
+			case "Stopped":
+				// Server is stopped, we need to wait for the login packet and then disconnect
+				handleStoppedServerLogin(ctx, conn, server)
+			default:
+				// Server is in an unknown state, disconnect with appropriate message
+				handleStoppedServerLogin(ctx, conn, server)
+			}
 		}
 
 	case mcpb.PacketIdLegacyServerListPing:
@@ -95,6 +105,42 @@ func handleConnection(ctx context.Context, conn net.Conn) {
 		}
 	}
 
+}
+
+// handleStoppedServerLogin handles the case when a user tries to log in to a stopped server
+func handleStoppedServerLogin(ctx context.Context, conn net.Conn, server *db.Server) {
+	// Set read deadline based on context
+	deadline, ok := ctx.Deadline()
+	if ok {
+		conn.SetReadDeadline(deadline)
+	}
+
+	// Read the login packet
+	bufferedReader := bufio.NewReader(conn)
+	loginPacket, err := mcpb.ReadPacket(bufferedReader, conn.RemoteAddr(), mcpb.StateLogin)
+	if err != nil {
+		log.Printf("Error reading login packet from %v: %v", conn.RemoteAddr(), err)
+		return
+	}
+
+	if loginPacket.PacketID == mcpb.PacketIdLogin {
+		// Determine the disconnect message based on server status
+		var message string
+		switch server.Status {
+		case "Stopped":
+			message = fmt.Sprintf("Server '%s' is currently offline", server.Name)
+		default:
+			message = fmt.Sprintf("Server '%s' is currently unavailable", server.Name)
+		}
+
+		// Send disconnect packet
+		err := mcpb.WriteLoginDisconnect(conn, message)
+		if err != nil {
+			log.Printf("Error writing login disconnect to %v: %v", conn.RemoteAddr(), err)
+		} else {
+			log.Printf("Disconnected %v from stopped server '%s': %s", conn.RemoteAddr(), server.Name, message)
+		}
+	}
 }
 
 func connectToBackend(ctx context.Context, conn net.Conn, server *db.Server, inspectBuffer *bytes.Buffer) {

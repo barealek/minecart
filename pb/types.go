@@ -58,6 +58,7 @@ const (
 	PacketIdHandshake            = 0x00
 	PacketIdLogin                = 0x00 // during StateLogin
 	PacketIdLegacyServerListPing = 0xFE
+	PacketIdLoginDisconnect      = 0x00 // Login Disconnect packet
 )
 
 type Handshake struct {
