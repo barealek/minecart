@@ -15,6 +15,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/blockrouter/ad"
 	"github.com/blockrouter/db"
 	mcpb "github.com/blockrouter/pb"
 )
@@ -46,22 +47,61 @@ func handleConnection(ctx context.Context, conn net.Conn) {
 			return
 		}
 
-		server := database.FindServerAddrByHost(hs.ServerAddress)
+		server := database.FindServerAddrBySubdomain(hs.ServerAddress)
 
-		if hs.NextState == mcpb.StateLogin {
-			// Check server status before connecting
-			switch server.Status {
-			case "Running":
-				connectToBackend(ctx, conn, server, inspectBuffer)
-			case "Stopped":
-				// Server is stopped, we need to wait for the login packet and then disconnect
-				handleStoppedServerLogin(ctx, conn, server)
+		switch server.Status {
+		case "Running":
+			// Forward all to the backend server so it can respond with real-time data
+			connectToBackend(ctx, conn, server, inspectBuffer)
+		case "Stopped":
+			// Handle offline status request
+			switch hs.NextState {
+			case mcpb.StateStatus:
+				writeCustomMotdResponse(conn, server, "§c• Offline", fmt.Sprintf("§9%s§7 is offline.\n", server.Name)+ad.ChooseAd())
+			case mcpb.StateLogin:
+				// Check if Eco mode is enabled and if the player can start the server
+				enabled := server.EcoConfig.Enabled && server.EcoConfig.StartWhenJoined
+				if enabled {
+					mcpb.WriteLoginDisconnect(conn, fmt.Sprintf("§9%s §7is starting up...", server.Name)+"\n§7It may take a moment. Refresh the server list until it appears online.")
+					return
+				}
+
+				// Otherwise, send a disconnect message
+				err := mcpb.WriteLoginDisconnect(conn, fmt.Sprintf("§7Server §9%s §7is currently offline", server.Name))
+				if err != nil {
+					log.Printf("Error writing login disconnect to %v: %v", conn.RemoteAddr(), err)
+				} else {
+					log.Printf("Disconnected %v from stopped server '%s'", conn.RemoteAddr(), server.Name)
+				}
 			default:
-				// Server is in an unknown state, disconnect with appropriate message
-				handleStoppedServerLogin(ctx, conn, server)
+				// Handle unexpected state
+				log.Printf("Unexpected handshake state %v for server %s", hs.NextState, server.Name)
+				conn.Close()
 			}
+
+		case "Starting":
+			// Handle starting server status
+			switch hs.NextState {
+			case mcpb.StateStatus:
+				writeCustomMotdResponse(conn, server, "§6⏳ Starting", "§cThis server is currently starting up, please wait.")
+			case mcpb.StateLogin:
+				err := mcpb.WriteLoginDisconnect(conn, fmt.Sprintf("Server '%s' is currently starting", server.Name))
+				if err != nil {
+					log.Printf("Error writing login disconnect to %v: %v", conn.RemoteAddr(), err)
+				} else {
+					log.Printf("Disconnected %v from starting server '%s'", conn.RemoteAddr(), server.Name)
+				}
+			default:
+				// Handle unexpected state
+				log.Printf("Unexpected handshake state %v for starting server %s", hs.NextState, server.Name)
+				conn.Close()
+			}
+		default:
+			// Handle unknown status
+			writeCustomMotdResponse(conn, server, "§cUnknown Status", "§cThis server is in an unknown state.")
 		}
 
+	// Handle legacy server list ping, which is a special case
 	case mcpb.PacketIdLegacyServerListPing:
 		fmt.Println("Received legacy server list ping")
 		hs, ok := receivedPacket.Data.(*mcpb.LegacyServerListPing)
@@ -71,7 +111,7 @@ func handleConnection(ctx context.Context, conn net.Conn) {
 			return
 		}
 
-		server := database.FindServerAddrByHost(hs.ServerAddress)
+		server := database.FindServerAddrBySubdomain(hs.ServerAddress)
 
 		switch server.Status {
 		case "Running":
@@ -107,42 +147,6 @@ func handleConnection(ctx context.Context, conn net.Conn) {
 		}
 	}
 
-}
-
-// handleStoppedServerLogin handles the case when a user tries to log in to a stopped server
-func handleStoppedServerLogin(ctx context.Context, conn net.Conn, server *db.Server) {
-	// Set read deadline based on context
-	deadline, ok := ctx.Deadline()
-	if ok {
-		conn.SetReadDeadline(deadline)
-	}
-
-	// Read the login packet
-	bufferedReader := bufio.NewReader(conn)
-	loginPacket, err := mcpb.ReadPacket(bufferedReader, conn.RemoteAddr(), mcpb.StateLogin)
-	if err != nil {
-		log.Printf("Error reading login packet from %v: %v", conn.RemoteAddr(), err)
-		return
-	}
-
-	if loginPacket.PacketID == mcpb.PacketIdLogin {
-		// Determine the disconnect message based on server status
-		var message string
-		switch server.Status {
-		case "Stopped":
-			message = fmt.Sprintf("Server '%s' is currently offline", server.Name)
-		default:
-			message = fmt.Sprintf("Server '%s' is currently unavailable", server.Name)
-		}
-
-		// Send disconnect packet
-		err := mcpb.WriteLoginDisconnect(conn, message)
-		if err != nil {
-			log.Printf("Error writing login disconnect to %v: %v", conn.RemoteAddr(), err)
-		} else {
-			log.Printf("Disconnected %v from stopped server '%s': %s", conn.RemoteAddr(), server.Name, message)
-		}
-	}
 }
 
 func connectToBackend(ctx context.Context, conn net.Conn, server *db.Server, inspectBuffer *bytes.Buffer) {
@@ -321,7 +325,7 @@ func main() {
 	}
 }
 
-func handleOfflineStatusRequest(conn net.Conn, server *db.Server, statusText, motd string) {
+func writeCustomMotdResponse(conn net.Conn, server *db.Server, statusText, motd string) {
 	fmt.Println("Handling offline status request for server:", server.Name)
 	// We need to continue reading packets in the status state
 	bufferedReader := bufio.NewReader(conn)
