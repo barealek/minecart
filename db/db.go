@@ -44,9 +44,17 @@ type Server struct {
 		MessageofTheDay string
 		Version         string
 	} `bson:"game_config"`
+	EcoConfig EcoConfig `bson:"eco_config"`
 }
 
-func (d *Db) FindServerAddrByHost(host string) *Server {
+type EcoConfig struct {
+	Enabled                bool     `json:"enabled" bson:"enabled"`                                                         // Whether Eco mode is enabled for the server. Stops the server when no players are online.
+	Timeout                int      `json:"timeout" bson:"timeout"`                                                         // Timeout in minutes before stopping the server when no players are online.
+	StartWhenJoined        bool     `json:"start_when_joined" bson:"start_when_joined"`                                     // Whether to start the server when a player joins.
+	StartWhenJoinWhitelist []string `json:"start_when_join_whitelist,omitempty" bson:"start_when_join_whitelist,omitempty"` // List of players who can start the server when they join. This is used to combat abusing autostart.
+}
+
+func (d *Db) FindServerAddrBySubdomain(host string) *Server {
 	var srvr Server
 
 	db := d.cl.Database(d.dbName)
