@@ -60,8 +60,12 @@ func handleConnection(ctx context.Context, conn net.Conn) {
 			// Handle offline status request
 			switch hs.NextState {
 			case mcpb.StateStatus:
+				motd := server.GameConfig.MessageofTheDay
+				if motd == "" {
+					motd = "A Minecraft Server"
+				}
 				// writeCustomMotdResponse(conn, server, "§c• Offline", fmt.Sprintf("§9%s§7 is offline.\n", server.Name)+ad.ChooseAd())
-				writeCustomMotdResponse(conn, server, "§c• Offline", server.GameConfig.MessageofTheDay+ad.ChooseAd())
+				writeCustomMotdResponse(conn, server, "§c• Offline", motd+ad.ChooseAd())
 			case mcpb.StateLogin:
 				// Read the login start packet to get the username
 				loginPacket, err := mcpb.ReadPacket(bufferedReader, conn.RemoteAddr(), mcpb.StateLogin)
