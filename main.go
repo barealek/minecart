@@ -20,6 +20,8 @@ import (
 	mcpb "github.com/blockrouter/pb"
 )
 
+var dbLocation string = "mongodb://root:safe()Password@cachy:27017"
+
 func handleConnection(ctx context.Context, conn net.Conn) {
 	defer conn.Close()
 
@@ -251,7 +253,12 @@ var database *db.Db
 
 func main() {
 	var err error
-	database, err = db.NewDb("mongodb://root:safe()Password@localhost:27017", "serverpanel")
+	if loc := os.Getenv("DB_LOCATION"); loc != "" {
+		dbLocation = loc
+		fmt.Println("Using DB_LOCATION from environment:", dbLocation)
+	}
+
+	database, err = db.NewDb(dbLocation, "serverpanel")
 	if err != nil {
 		log.Fatalf("Failed to connect to database: %v", err)
 	}
