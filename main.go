@@ -10,6 +10,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -59,21 +60,49 @@ func handleConnection(ctx context.Context, conn net.Conn) {
 			// Handle offline status request
 			switch hs.NextState {
 			case mcpb.StateStatus:
-				writeCustomMotdResponse(conn, server, "§c• Offline", fmt.Sprintf("§9%s§7 is offline.\n", server.Name)+ad.ChooseAd())
+				// writeCustomMotdResponse(conn, server, "§c• Offline", fmt.Sprintf("§9%s§7 is offline.\n", server.Name)+ad.ChooseAd())
+				writeCustomMotdResponse(conn, server, "§c• Offline", server.GameConfig.MessageofTheDay+ad.ChooseAd())
 			case mcpb.StateLogin:
-				// Check if Eco mode is enabled and if the player can start the server
-				enabled := server.EcoConfig.Enabled && server.EcoConfig.StartWhenJoined
-				if enabled {
-					mcpb.WriteLoginDisconnect(conn, fmt.Sprintf("§9%s §7is starting up...", server.Name)+"\n§7It may take a moment. Refresh the server list until it appears online.")
+				// Read the login start packet to get the username
+				loginPacket, err := mcpb.ReadPacket(bufferedReader, conn.RemoteAddr(), mcpb.StateLogin)
+				if err != nil {
+					log.Printf("Error reading login packet from %v: %v", conn.RemoteAddr(), err)
 					return
 				}
 
+				if loginPacket.PacketID != mcpb.PacketIdLogin {
+					log.Printf("Unexpected packet ID %d from %v during login", loginPacket.PacketID, conn.RemoteAddr())
+					return
+				}
+
+				loginStart, err := mcpb.DecodeLoginStart(loginPacket.Data)
+				if err != nil {
+					log.Printf("Error decoding login start from %v: %v", conn.RemoteAddr(), err)
+					return
+				}
+
+				// Check if Eco mode is enabled and if the player can start the server
+				enabled := server.EcoConfig.Enabled && server.EcoConfig.StartWhenJoined
+				if enabled {
+					// Check if the username is in the whitelist (if whitelist exists)
+					canStart := len(server.EcoConfig.StartWhenJoinWhitelist) == 0
+					if !canStart {
+						canStart = slices.Contains(server.EcoConfig.StartWhenJoinWhitelist, loginStart.Name)
+					}
+
+					if canStart {
+						mcpb.WriteLoginDisconnect(conn, fmt.Sprintf("§9%s §7is starting up...", server.Name)+"\n§7It may take a moment. Refresh the server list until it appears online.")
+						log.Printf("Player %s triggered server start for '%s'", loginStart.Name, server.Name)
+						return
+					}
+				}
+
 				// Otherwise, send a disconnect message
-				err := mcpb.WriteLoginDisconnect(conn, fmt.Sprintf("§7Server §9%s §7is currently offline", server.Name))
+				err = mcpb.WriteLoginDisconnect(conn, fmt.Sprintf("§7Server §9%s §7is currently offline", server.Name))
 				if err != nil {
 					log.Printf("Error writing login disconnect to %v: %v", conn.RemoteAddr(), err)
 				} else {
-					log.Printf("Disconnected %v from stopped server '%s'", conn.RemoteAddr(), server.Name)
+					log.Printf("Disconnected %s (%v) from stopped server '%s'", loginStart.Name, conn.RemoteAddr(), server.Name)
 				}
 			default:
 				// Handle unexpected state
@@ -85,7 +114,7 @@ func handleConnection(ctx context.Context, conn net.Conn) {
 			// Handle starting server status
 			switch hs.NextState {
 			case mcpb.StateStatus:
-				writeCustomMotdResponse(conn, server, "§6⏳ Starting", "§cThis server is currently starting up, please wait.")
+				writeCustomMotdResponse(conn, server, "§6⏳ Starting", server.GameConfig.MessageofTheDay+ad.ChooseAd())
 			case mcpb.StateLogin:
 				err := mcpb.WriteLoginDisconnect(conn, fmt.Sprintf("Server '%s' is currently starting", server.Name))
 				if err != nil {
@@ -355,7 +384,37 @@ func writeCustomMotdResponse(conn net.Conn, server *db.Server, statusText, motd 
 				},
 				"players": {
 					"max": 0,
-					"online": 0
+					"online": 0,
+					"sample": [
+						{
+							"name": "§8§l======================================",
+							"id": "00000000-0000-0000-0000-000000000000"
+						},
+						{
+							"name": "",
+							"id": "00000000-0000-0000-0000-000000000000"
+						},
+						{
+							"name": "§7Get your server at §bPlexHost",
+							"id": "00000000-0000-0000-0000-000000000000"
+						},
+						{
+							"name": "§7Up to §b§u100 hours §7of gameplay for a single dollar",
+							"id": "00000000-0000-0000-0000-000000000000"
+						},
+						{
+							"name": "§7Sign up and get §b50 credits§7 for free at §bPlexhost.com§7!",
+							"id": "00000000-0000-0000-0000-000000000000"
+						},
+						{
+							"name": "",
+							"id": "00000000-0000-0000-0000-000000000000"
+						},
+						{
+							"name": "§8§l======================================",
+							"id": "00000000-0000-0000-0000-000000000000"
+						}
+					]
 				},
 				"description": {
 					"text": "%s"
