@@ -3,9 +3,9 @@ package ad
 import "math/rand"
 
 var ads = []string{
-	"§7Get your server at §bPlexHost§7!",
-	"§7Hosting your server with §bPlexHost§7 is easy!",
-	"§7Get §b50 credits§7 for free at §bPlexhost.com§7!",
+	// "§7Get your server at §bPlexHost§7!",
+	// "§7Hosting your server with §bPlexHost§7 is easy!",
+	// "§7Get §b50 credits§7 for free at §bPlexhost.com§7!",
 	"§7Powered by §bPlexHost§7!",
 	"§7Visit §bPlexhost.com§7 for more info!",
 }
