@@ -26,11 +26,8 @@ var dbLocation string = "mongodb://root:safe()Password@cachy:27017"
 func handleConnection(ctx context.Context, conn net.Conn) {
 	defer conn.Close()
 
-	// Set read deadline based on context
-	deadline, ok := ctx.Deadline()
-	if ok {
-		conn.SetReadDeadline(deadline)
-	}
+	// Set read deadline for initial packet reading (30 seconds)
+	conn.SetReadDeadline(time.Now().Add(30 * time.Second))
 
 	inspectBuffer := new(bytes.Buffer)
 	inspectReader := io.TeeReader(conn, inspectBuffer)
@@ -38,7 +35,15 @@ func handleConnection(ctx context.Context, conn net.Conn) {
 
 	receivedPacket, err := mcpb.ReadPacket(bufferedReader, conn.RemoteAddr(), mcpb.StateHandshaking)
 	if err != nil {
-		log.Printf("Error reading packet from %v: %v", conn.RemoteAddr(), err)
+		if err == io.EOF {
+			// Client disconnected during handshake, this is normal
+			log.Printf("Client %v disconnected during handshake", conn.RemoteAddr())
+		} else if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+			// Connection timeout
+			log.Printf("Timeout reading handshake packet from %v", conn.RemoteAddr())
+		} else {
+			log.Printf("Error reading packet from %v: %v", conn.RemoteAddr(), err)
+		}
 		return
 	}
 
@@ -50,7 +55,18 @@ func handleConnection(ctx context.Context, conn net.Conn) {
 			return
 		}
 
-		server := database.FindServerAddrBySubdomain(hs.ServerAddress)
+		server, err := database.FindServerAddrBySubdomain(hs.ServerAddress)
+		if err != nil {
+			panic(err)
+		}
+		if server == nil {
+			log.Printf("No server found for subdomain %s from %v", hs.ServerAddress, conn.RemoteAddr())
+			err = mcpb.WriteLoginDisconnect(conn, fmt.Sprintf("§c• Offline\n§7Server %s not found.", hs.ServerAddress))
+			if err != nil {
+				log.Printf("Error writing disconnect message to %v: %v", conn.RemoteAddr(), err)
+			}
+			return
+		}
 
 		switch server.Status {
 		case "Running":
@@ -65,12 +81,18 @@ func handleConnection(ctx context.Context, conn net.Conn) {
 					motd = "A Minecraft Server"
 				}
 				// writeCustomMotdResponse(conn, server, "§c• Offline", fmt.Sprintf("§9%s§7 is offline.\n", server.Name)+ad.ChooseAd())
-				writeCustomMotdResponse(conn, server, "§c• Offline", motd+ad.ChooseAd())
+				writeCustomMotdResponse(conn, bufferedReader, server, "§c• Offline", motd+ad.ChooseAd())
 			case mcpb.StateLogin:
 				// Read the login start packet to get the username
 				loginPacket, err := mcpb.ReadPacket(bufferedReader, conn.RemoteAddr(), mcpb.StateLogin)
 				if err != nil {
-					log.Printf("Error reading login packet from %v: %v", conn.RemoteAddr(), err)
+					if err == io.EOF {
+						log.Printf("Client %v disconnected during login", conn.RemoteAddr())
+					} else if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+						log.Printf("Timeout reading login packet from %v", conn.RemoteAddr())
+					} else {
+						log.Printf("Error reading login packet from %v: %v", conn.RemoteAddr(), err)
+					}
 					return
 				}
 
@@ -118,7 +140,11 @@ func handleConnection(ctx context.Context, conn net.Conn) {
 			// Handle starting server status
 			switch hs.NextState {
 			case mcpb.StateStatus:
-				writeCustomMotdResponse(conn, server, "§6⏳ Starting", server.GameConfig.MessageofTheDay+ad.ChooseAd())
+				motd := server.GameConfig.MessageofTheDay
+				if motd == "" {
+					motd = "A Minecraft Server"
+				}
+				writeCustomMotdResponse(conn, bufferedReader, server, "§6⏳ Starting", motd+ad.ChooseAd())
 			case mcpb.StateLogin:
 				err := mcpb.WriteLoginDisconnect(conn, fmt.Sprintf("Server '%s' is currently starting", server.Name))
 				if err != nil {
@@ -133,7 +159,7 @@ func handleConnection(ctx context.Context, conn net.Conn) {
 			}
 		default:
 			// Handle unknown status
-			writeCustomMotdResponse(conn, server, "§cUnknown Status", "§cThis server is in an unknown state.")
+			writeCustomMotdResponse(conn, bufferedReader, server, "§cUnknown Status", "§cThis server is in an unknown state.")
 		}
 
 	// Handle legacy server list ping, which is a special case
@@ -146,7 +172,25 @@ func handleConnection(ctx context.Context, conn net.Conn) {
 			return
 		}
 
-		server := database.FindServerAddrBySubdomain(hs.ServerAddress)
+		server, err := database.FindServerAddrBySubdomain(hs.ServerAddress)
+		if err != nil {
+			panic(err)
+		}
+		if server == nil {
+			log.Printf("No server found for subdomain %s from %v", hs.ServerAddress, conn.RemoteAddr())
+			err = mcpb.WriteLegacyServerListPingResponse(
+				conn,
+				999,
+				"Not found", // Protocol version not applicable here
+				fmt.Sprintf("§c• Offline\n§7Server %s not found.", hs.ServerAddress),
+				0, // Current players
+				0, // Max players
+			)
+			if err != nil {
+				log.Printf("Error writing legacy server list ping response to %v: %v", conn.RemoteAddr(), err)
+			}
+			return
+		}
 
 		switch server.Status {
 		case "Running":
@@ -365,16 +409,26 @@ func main() {
 	}
 }
 
-func writeCustomMotdResponse(conn net.Conn, server *db.Server, statusText, motd string) {
+func writeCustomMotdResponse(conn net.Conn, reader *bufio.Reader, server *db.Server, statusText, motd string) {
 	fmt.Println("Handling offline status request for server:", server.Name)
-	// We need to continue reading packets in the status state
-	bufferedReader := bufio.NewReader(conn)
+	// Use the existing buffered reader instead of creating a new one
+
+	// Set a timeout for status packet reading (15 seconds)
+	conn.SetReadDeadline(time.Now().Add(15 * time.Second))
 
 	for {
 		// Read the next packet in status state
-		packet, err := mcpb.ReadPacket(bufferedReader, conn.RemoteAddr(), mcpb.StateStatus)
+		packet, err := mcpb.ReadPacket(reader, conn.RemoteAddr(), mcpb.StateStatus)
 		if err != nil {
-			log.Printf("Error reading status packet: %v", err)
+			if err == io.EOF {
+				// Client disconnected, this is normal
+				log.Printf("Client %v disconnected during status request", conn.RemoteAddr())
+			} else if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				// Connection timeout
+				log.Printf("Timeout reading status packet from %v", conn.RemoteAddr())
+			} else {
+				log.Printf("Error reading status packet from %v: %v", conn.RemoteAddr(), err)
+			}
 			return
 		}
 
