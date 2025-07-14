@@ -54,15 +54,19 @@ type EcoConfig struct {
 	StartWhenJoinWhitelist []string `json:"start_when_join_whitelist,omitempty" bson:"start_when_join_whitelist,omitempty"` // List of players who can start the server when they join. This is used to combat abusing autostart.
 }
 
-func (d *Db) FindServerAddrBySubdomain(host string) *Server {
+func (d *Db) FindServerAddrBySubdomain(host string) (*Server, error) {
 	var srvr Server
 
 	db := d.cl.Database(d.dbName)
 
 	err := db.Collection("servers").FindOne(context.Background(), map[string]string{"subdomain": host}).Decode(&srvr)
 	if err != nil {
+		if err == mongo.ErrNoDocuments {
+			fmt.Println("No server found with subdomain:", host)
+			return nil, nil
+		}
 		fmt.Println("Error finding server by host:", err)
-		return nil
+		return nil, err
 	}
-	return &srvr
+	return &srvr, nil
 }
