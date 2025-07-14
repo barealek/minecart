@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/signal"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -60,11 +61,9 @@ func handleConnection(ctx context.Context, conn net.Conn) {
 			panic(err)
 		}
 		if server == nil {
-			log.Printf("No server found for subdomain %s from %v", hs.ServerAddress, conn.RemoteAddr())
-			err = mcpb.WriteLoginDisconnect(conn, fmt.Sprintf("§c• Offline\n§7Server %s not found.", hs.ServerAddress))
-			if err != nil {
-				log.Printf("Error writing disconnect message to %v: %v", conn.RemoteAddr(), err)
-			}
+			addr := strings.Split(hs.ServerAddress, ".")[0]
+			writeCustomMotdResponse(conn, bufferedReader, "§c• Not found", "§7Server §b"+addr+"§7 not found."+ad.ChooseAd())
+			conn.Close()
 			return
 		}
 
@@ -81,7 +80,7 @@ func handleConnection(ctx context.Context, conn net.Conn) {
 					motd = "A Minecraft Server"
 				}
 				// writeCustomMotdResponse(conn, server, "§c• Offline", fmt.Sprintf("§9%s§7 is offline.\n", server.Name)+ad.ChooseAd())
-				writeCustomMotdResponse(conn, bufferedReader, server, "§c• Offline", motd+ad.ChooseAd())
+				writeCustomMotdResponse(conn, bufferedReader, "§c• Offline", motd+ad.ChooseAd())
 			case mcpb.StateLogin:
 				// Read the login start packet to get the username
 				loginPacket, err := mcpb.ReadPacket(bufferedReader, conn.RemoteAddr(), mcpb.StateLogin)
@@ -144,7 +143,7 @@ func handleConnection(ctx context.Context, conn net.Conn) {
 				if motd == "" {
 					motd = "A Minecraft Server"
 				}
-				writeCustomMotdResponse(conn, bufferedReader, server, "§6⏳ Starting", motd+ad.ChooseAd())
+				writeCustomMotdResponse(conn, bufferedReader, "§6⏳ Starting", motd+ad.ChooseAd())
 			case mcpb.StateLogin:
 				err := mcpb.WriteLoginDisconnect(conn, fmt.Sprintf("Server '%s' is currently starting", server.Name))
 				if err != nil {
@@ -159,7 +158,7 @@ func handleConnection(ctx context.Context, conn net.Conn) {
 			}
 		default:
 			// Handle unknown status
-			writeCustomMotdResponse(conn, bufferedReader, server, "§cUnknown Status", "§cThis server is in an unknown state.")
+			writeCustomMotdResponse(conn, bufferedReader, "§cUnknown Status", "§cThis server is in an unknown state.")
 		}
 
 	// Handle legacy server list ping, which is a special case
@@ -177,12 +176,11 @@ func handleConnection(ctx context.Context, conn net.Conn) {
 			panic(err)
 		}
 		if server == nil {
-			log.Printf("No server found for subdomain %s from %v", hs.ServerAddress, conn.RemoteAddr())
-			err = mcpb.WriteLegacyServerListPingResponse(
+			addr := strings.Split(hs.ServerAddress, ".")[0]
+			err := mcpb.WriteLegacyServerListPingResponse(
 				conn,
-				999,
-				"Not found", // Protocol version not applicable here
-				fmt.Sprintf("§c• Offline\n§7Server %s not found.", hs.ServerAddress),
+				9999,
+				"§c• Not found", "§7Server §b"+addr+"§7 not found."+ad.ChooseAd(),
 				0, // Current players
 				0, // Max players
 			)
@@ -409,8 +407,7 @@ func main() {
 	}
 }
 
-func writeCustomMotdResponse(conn net.Conn, reader *bufio.Reader, server *db.Server, statusText, motd string) {
-	fmt.Println("Handling offline status request for server:", server.Name)
+func writeCustomMotdResponse(conn net.Conn, reader *bufio.Reader, statusText, motd string) {
 	// Use the existing buffered reader instead of creating a new one
 
 	// Set a timeout for status packet reading (15 seconds)
